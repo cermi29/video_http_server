@@ -92,13 +92,17 @@ pub async fn get_item<'a>(name: String) -> (&'a mut DbItem, usize, bool, HeaderV
 }
 
 // marks item for deletion
-fn mark_for_deletion(item: &mut DbItem) {
-    let _lock = item.mtx.lock();
-    item.for_deletion = true;
-    if !item.has_writer {
-        // combination of no writer and 0 len stops all readers
-        item.len = 0; // we would let the writer do this since he accesses it without mutex
+fn mark_for_deletion(item: &mut DbItem) -> bool {
+    if !item.for_deletion {
+        let _lock = item.mtx.lock();
+        item.for_deletion = true;
+        if !item.has_writer {
+            // combination of no writer and 0 len stops all readers
+            item.len = 0; // we would let the writer do this since he accesses it without mutex
+        }
+        return true;
     }
+    return false;
 }
 
 // frees space allocated by a deleted item
@@ -118,14 +122,15 @@ pub async fn delete_item<'a>(name: String) -> StatusCode {
         hashed_name %= DB_LENGTH;
         unsafe {
             if DB[hashed_name].name == name && !DB[hashed_name].for_deletion {
-                mark_for_deletion(&mut DB[hashed_name]);
-                tokio::spawn(async move {
-                    let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(5));
-                    interval.tick().await; // completes instantly
-                    interval.tick().await; // give time to readers and writer to finish
-                    free_deleted_item(&mut DB[hashed_name]); // should be safe to delete now
-                });
-                return StatusCode::ACCEPTED;
+                if mark_for_deletion(&mut DB[hashed_name]) {
+                    tokio::spawn(async move {
+                        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(5));
+                        interval.tick().await; // completes instantly
+                        interval.tick().await; // give time to readers and writer to finish
+                        free_deleted_item(&mut DB[hashed_name]); // should be safe to delete now
+                    });
+                    return StatusCode::ACCEPTED;
+                }
             }
         }
     }
@@ -354,7 +359,7 @@ impl<'a> Stream for DbItemStream<'a> {
             }
             self.was_first_waiter = false;
         }
-        if self.start != self.end && !self.item.for_deletion { // for_deletion check is not useless, setting len to 0 could be delayed
+        if self.start < self.end && !self.item.for_deletion { // for_deletion check is not useless, setting len to 0 could be delayed
             if self.item.len > self.start {
                 // return a readable chunk of data
                 let chunk = &self.item.chunks[self.start / CHUNK_SIZE];
